@@ -1,0 +1,7 @@
+{
+  "name":"brazilian-jishan-bot",
+  "private":true,
+  "version":"1.0.0",
+  "engines":{"node":">=20"},
+  "dependencies":{"@libsql/client":"^0.15.7","bcryptjs":"^3.0.2"}
+}
