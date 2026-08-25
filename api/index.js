@@ -22,7 +22,7 @@ async function handler(req,res){
     const path=new URL(req.url,'http://localhost').pathname;
     if(req.method==='POST'&&path==='/api/purchase'){
       const b=await body(req);
-      if(!b.proof||typeof b.proof!=='string'||b.proof.length>7_000_000)return json(res,400,{error:'Invalid payment proof.'});
+      if(!b.proof||typeof b.proof!=='string'||b.proof.length>2_400_000)return json(res,400,{error:'Payment screenshot is too large. Please choose a smaller screenshot.'});
       await db.execute({sql:'INSERT INTO purchases(reference,proof,payment_method,payment_account,created_at) VALUES(?,?,?,?,?)',args:[String(b.reference||'').slice(0,80),b.proof,String(b.payment_method||'BINANCE').slice(0,30),String(b.payment_account||'853973504').slice(0,80),Date.now()]});
       return json(res,201,{ok:true});
     }
