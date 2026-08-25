@@ -3,25 +3,150 @@ const bcrypt=require('bcryptjs');
 const crypto=require('crypto');
 const db=createClient({url:process.env.TURSO_DATABASE_URL,authToken:process.env.TURSO_AUTH_TOKEN});
 let initialized=false;
-async function init(){if(initialized)return;await db.batch([{sql:`CREATE TABLE IF NOT EXISTS purchases(id INTEGER PRIMARY KEY AUTOINCREMENT,reference TEXT,proof TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT 'pending',password_hash TEXT,created_at INTEGER NOT NULL,approved_at INTEGER,expires_at INTEGER,payment_method TEXT,payment_account TEXT)`},{sql:`CREATE TABLE IF NOT EXISTS sessions_v2(token TEXT PRIMARY KEY,purchase_id INTEGER NOT NULL,device_id TEXT NOT NULL,created_at INTEGER NOT NULL)`}],'write');for(const sql of [`ALTER TABLE purchases ADD COLUMN password_hash TEXT`,`ALTER TABLE purchases ADD COLUMN payment_method TEXT`,`ALTER TABLE purchases ADD COLUMN payment_account TEXT`]){try{await db.execute(sql)}catch{}}initialized=true}
+
+async function init(){
+  if(initialized)return;
+  await db.batch([
+    {sql:`CREATE TABLE IF NOT EXISTS purchases(id INTEGER PRIMARY KEY AUTOINCREMENT,reference TEXT,proof TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT 'pending',password_hash TEXT,created_at INTEGER NOT NULL,approved_at INTEGER,expires_at INTEGER,payment_method TEXT,payment_account TEXT)`},
+    {sql:`CREATE TABLE IF NOT EXISTS sessions_v2(token TEXT PRIMARY KEY,purchase_id INTEGER,device_id TEXT,created_at INTEGER)`}
+  ],'write');
+
+  // IMPORTANT: the existing Turso database may contain an older sessions_v2 table
+  // without the newer columns. CREATE TABLE IF NOT EXISTS does not migrate it.
+  // Add the columns safely so old databases work without being recreated.
+  for(const sql of [
+    `ALTER TABLE purchases ADD COLUMN password_hash TEXT`,
+    `ALTER TABLE purchases ADD COLUMN payment_method TEXT`,
+    `ALTER TABLE purchases ADD COLUMN payment_account TEXT`,
+    `ALTER TABLE sessions_v2 ADD COLUMN purchase_id INTEGER`,
+    `ALTER TABLE sessions_v2 ADD COLUMN device_id TEXT`,
+    `ALTER TABLE sessions_v2 ADD COLUMN created_at INTEGER`
+  ]){try{await db.execute(sql)}catch{}}
+  initialized=true;
+}
+
 const json=(res,status,data)=>{res.statusCode=status;res.setHeader('Content-Type','application/json; charset=utf-8');res.end(JSON.stringify(data))};
 const body=async req=>{let s='';for await(const c of req)s+=c;if(s.length>4000000)throw Error('Request is too large.');try{return s?JSON.parse(s):{}}catch{throw Error('Invalid JSON request.')}};
 const admin=req=>req.headers['x-admin-key']===process.env.ADMIN_KEY;
-async function auth(req){const h=req.headers.authorization||'';if(!h.startsWith('Bearer '))return null;const r=await db.execute({sql:`SELECT s.*,p.expires_at,p.status FROM sessions_v2 s JOIN purchases p ON p.id=s.purchase_id WHERE s.token=? AND p.status='approved'`,args:[h.slice(7)]});const row=r.rows[0];if(!row||(row.expires_at&&Date.now()>row.expires_at))return null;return row}
+
+async function auth(req){
+  const h=req.headers.authorization||'';
+  if(!h.startsWith('Bearer '))return null;
+  const r=await db.execute({sql:`SELECT s.*,p.expires_at,p.status FROM sessions_v2 s JOIN purchases p ON p.id=s.purchase_id WHERE s.token=? AND p.status='approved'`,args:[h.slice(7)]});
+  const row=r.rows[0];
+  if(!row||(row.expires_at&&Date.now()>row.expires_at))return null;
+  return row;
+}
+
 const REAL=['AUD/CAD','AUD/CHF','AUD/JPY','AUD/NZD','AUD/USD','CAD/CHF','CAD/JPY','CHF/JPY','EUR/AUD','EUR/CAD','EUR/CHF','EUR/GBP','EUR/JPY','EUR/NZD','EUR/SGD','EUR/USD','GBP/AUD','GBP/CAD','GBP/CHF','GBP/JPY','GBP/USD','NZD/JPY','NZD/USD','USDCAD','USD/CHF','USD/JPY','XAG/USD','XAU/USD','AXJAUD','DOW JONES','DAX','FTSE 100','NASDAQ 100','S&P 500','CAC 40','EURO STOXX 50','IBEX 35','NIKKEI 225','HONG KONG 50','CHINA A50'];
 const OTC=['AUD/CAD OTC','AUD/CHF OTC','AUD/JPY OTC','AUD/NZD OTC','AUD/USD OTC','CAD/CHF OTC','CAD/JPY OTC','CHF/JPY OTC','EUR/AUD OTC','EUR/CAD OTC','EUR/CHF OTC','EUR/GBP OTC','EUR/JPY OTC','EUR/NZD OTC','EUR/SGD OTC','EUR/USD OTC','GBP/AUD OTC','GBP/CAD OTC','GBP/CHF OTC','GBP/JPY OTC','GBP/USD OTC','NZD/JPY OTC','NZD/USD OTC','USD/CAD OTC','USD/CHF OTC','USD/JPY OTC','USD/BRL OTC','USD/INR OTC','USD/PKR OTC','USD/BDT OTC','USD/MXN OTC','USD/COP OTC','USD/PHP OTC','USD/IDR OTC','USD/TRY OTC','USD/EGP OTC','USD/CLP OTC','USD/ARS OTC','USD/RUB OTC','USD/SGD OTC','USD/THB OTC','USD/VND OTC','USD/DZD OTC','USD/NGN OTC','USD/UAH OTC','EUR/TRY OTC','EUR/RUB OTC','EUR/HUF OTC','BRL/USD OTC','NGN/USD OTC','KES/USD OTC','YER/USD OTC','TND/USD OTC','MAD/USD OTC','LBP/USD OTC','ZAR/USD OTC','AED/CNY OTC','BHD/CNY OTC','JOD/CNY OTC','QAR/CNY OTC','OMR/CNY OTC','SAR/CNY OTC','GOLD OTC','SILVER OTC','US CRUDE OTC','UK BRENT OTC','BTC/USD OTC','ETH/USD OTC','XRP/USD OTC','LTC/USD OTC','BNB/USD OTC','BCH/USD OTC','DOGE/USD OTC','ADA/USD OTC','APT/USD OTC','ARB/USD OTC','AXS/USD OTC'];
 const ASSETS=[...REAL.map(name=>({name,otc:false})),...OTC.map(name=>({name,otc:true}))];
-async function handler(req,res){try{if(!process.env.TURSO_DATABASE_URL||!process.env.TURSO_AUTH_TOKEN)return json(res,500,{error:'Database is not configured.'});await init();const path=new URL(req.url,'http://localhost').pathname;
-if(req.method==='POST'&&path==='/api/purchase'){const b=await body(req);if(!b.proof)return json(res,400,{error:'Payment screenshot is required.'});if(!String(b.reference||'').trim())return json(res,400,{error:'Payment reference is required.'});if(String(b.proof).length>2400000)return json(res,400,{error:'Payment screenshot is too large.'});const r=await db.execute({sql:`INSERT INTO purchases(reference,proof,payment_method,payment_account,created_at) VALUES(?,?,?,?,?)`,args:[String(b.reference).trim().slice(0,80),String(b.proof),String(b.payment_method||'BINANCE').slice(0,30),String(b.payment_account||'853973504').slice(0,80),Date.now()]});return json(res,201,{ok:true,payment_id:Number(r.lastInsertRowid)})}
-if(req.method==='GET'&&path==='/api/payment-status'){const id=Number(new URL(req.url,'http://localhost').searchParams.get('id'));if(!id)return json(res,400,{error:'Invalid payment id.'});const r=await db.execute({sql:`SELECT id,status,password_hash,expires_at FROM purchases WHERE id=?`,args:[id]});if(!r.rows.length)return json(res,404,{error:'Payment not found.'});const p=r.rows[0];return json(res,200,{status:p.status,hasPassword:!!p.password_hash,expiresAt:p.expires_at||null})}
-if(req.method==='POST'&&path==='/api/create-account'){const b=await body(req),password=String(b.password||''),confirm=String(b.confirmPassword||''),purchaseId=Number(b.purchase_id);if(!purchaseId||!password||!confirm)return json(res,400,{error:'Password and confirmation are required.'});if(password!==confirm)return json(res,400,{error:'Passwords do not match.'});if(password.length<8||password.length>128)return json(res,400,{error:'Password must be 8-128 characters.'});const p=await db.execute({sql:`SELECT id,status,password_hash FROM purchases WHERE id=? LIMIT 1`,args:[purchaseId]}),row=p.rows[0];if(!row||row.status!=='approved')return json(res,403,{error:'Payment has not been approved.'});if(row.password_hash)return json(res,409,{error:'Password is already set for this purchase.'});const hash=await bcrypt.hash(password,12);const u=await db.execute({sql:`UPDATE purchases SET password_hash=? WHERE id=? AND status='approved' AND password_hash IS NULL`,args:[hash,purchaseId]});if(!u.rowsAffected)return json(res,409,{error:'Password is already set for this purchase.'});return json(res,200,{ok:true})}
-if(req.method==='POST'&&path==='/api/login'){const b=await body(req),password=String(b.password||''),deviceId=String(b.device_id||'');if(!password||!deviceId)return json(res,400,{error:'Password and device are required.'});const r=await db.execute({sql:`SELECT id,password_hash,expires_at,status FROM purchases WHERE status IN ('approved','disabled') AND password_hash IS NOT NULL ORDER BY id DESC`});let p=null;for(const row of r.rows){if(row.expires_at&&Date.now()>row.expires_at)continue;if(await bcrypt.compare(password,row.password_hash)){p=row;break}}if(!p)return json(res,401,{error:'Invalid password.'});if(p.status==='disabled')return json(res,403,{error:'এই এক্সেস কোডটি অফ করা হয়েছে। পুনরায় চালু করতে @JISANexe এই টেলিগ্রাম আইডিতে যোগাযোগ করুন।'});const old=await db.execute({sql:`SELECT * FROM sessions_v2 WHERE purchase_id=? LIMIT 1`,args:[p.id]});if(old.rows.length&&old.rows[0].device_id!==deviceId)return json(res,409,{error:'এই Password একটি অন্য ডিভাইসে ব্যবহার হচ্ছে। এক Password একসাথে দুই ডিভাইসে চলবে না।'});const token=crypto.randomBytes(32).toString('hex');if(old.rows.length)await db.execute({sql:`UPDATE sessions_v2 SET token=?,device_id=?,created_at=? WHERE purchase_id=?`,args:[token,deviceId,Date.now(),p.id]});else await db.execute({sql:`INSERT INTO sessions_v2(token,purchase_id,device_id,created_at) VALUES(?,?,?,?)`,args:[token,p.id,deviceId,Date.now()]});return json(res,200,{session:token})}
-if(req.method==='GET'&&path==='/api/markets'){if(!await auth(req))return json(res,401,{error:'Login required.'});return json(res,200,{markets:ASSETS})}
-if(req.method==='POST'&&path==='/api/signal'){if(!await auth(req))return json(res,401,{error:'Login required.'});const b=await body(req),market=ASSETS.find(x=>x.name===String(b.market||''));if(!market)return json(res,400,{error:'Invalid asset.'});const allowed=market.otc?['5 SEC','10 SEC','15 SEC','30 SEC','1 MINUTE','5 MINUTE']:['1 MINUTE','5 MINUTE'];if(!allowed.includes(b.timeframe))return json(res,400,{error:'Invalid timeframe for this market.'});return json(res,200,{direction:Math.random()<.5?'UP':'DOWN',generated_at:Date.now(),mode:'generated/demo'})}
-if(req.method==='GET'&&path==='/api/admin/purchases'){if(!admin(req))return json(res,401,{error:'Unauthorized'});const r=await db.execute(`SELECT id,reference,proof,payment_method,payment_account,status,password_hash,created_at,approved_at,expires_at FROM purchases ORDER BY id DESC`);return json(res,200,{items:r.rows.map(x=>({...x,password_set:!!x.password_hash,password_hash:undefined}))})}
-if(req.method==='POST'&&path==='/api/admin/approve'){if(!admin(req))return json(res,401,{error:'Unauthorized'});const b=await body(req),id=Number(b.purchase_id);if(!id)return json(res,400,{error:'purchase_id required'});const now=Date.now();const r=await db.execute({sql:`UPDATE purchases SET status='approved',approved_at=?,expires_at=? WHERE id=? AND status='pending'`,args:[now,now+30*24*60*60*1000,id]});return json(res,200,{ok:r.rowsAffected>0,message:'Payment accepted. User creates their own password.'})}
-if(req.method==='POST'&&path==='/api/admin/reject'){if(!admin(req))return json(res,401,{error:'Unauthorized'});const b=await body(req),id=Number(b.purchase_id);if(!id)return json(res,400,{error:'purchase_id required'});await db.execute({sql:`UPDATE purchases SET status='rejected' WHERE id=? AND status='pending'`,args:[id]});return json(res,200,{ok:true})}
-if(req.method==='POST'&&path==='/api/admin/disable'){if(!admin(req))return json(res,401,{error:'Unauthorized'});const b=await body(req),id=Number(b.purchase_id);if(!id)return json(res,400,{error:'purchase_id required'});await db.execute({sql:`UPDATE purchases SET status='disabled' WHERE id=? AND status='approved'`,args:[id]});await db.execute({sql:`DELETE FROM sessions_v2 WHERE purchase_id=?`,args:[id]});return json(res,200,{ok:true,message:'Access disabled.'})}
-if(req.method==='POST'&&path==='/api/admin/enable'){if(!admin(req))return json(res,401,{error:'Unauthorized'});const b=await body(req),id=Number(b.purchase_id);if(!id)return json(res,400,{error:'purchase_id required'});const now=Date.now();await db.execute({sql:`UPDATE purchases SET status='approved',expires_at=? WHERE id=? AND status='disabled'`,args:[now+30*24*60*60*1000,id]});return json(res,200,{ok:true,message:'Access enabled.'})}
-return json(res,404,{error:'Not found'})}catch(err){console.error(err);return json(res,500,{error:err?.message||'Server error.'})}}
+
+async function handler(req,res){try{
+  if(!process.env.TURSO_DATABASE_URL||!process.env.TURSO_AUTH_TOKEN)return json(res,500,{error:'Database is not configured.'});
+  await init();
+  const path=new URL(req.url,'http://localhost').pathname;
+
+  if(req.method==='POST'&&path==='/api/purchase'){
+    const b=await body(req);
+    if(!b.proof)return json(res,400,{error:'Payment screenshot is required.'});
+    if(!String(b.reference||'').trim())return json(res,400,{error:'Payment reference is required.'});
+    if(String(b.proof).length>2400000)return json(res,400,{error:'Payment screenshot is too large.'});
+    const r=await db.execute({sql:`INSERT INTO purchases(reference,proof,payment_method,payment_account,created_at) VALUES(?,?,?,?,?)`,args:[String(b.reference).trim().slice(0,80),String(b.proof),String(b.payment_method||'BINANCE').slice(0,30),String(b.payment_account||'853973504').slice(0,80),Date.now()]});
+    return json(res,201,{ok:true,payment_id:Number(r.lastInsertRowid)});
+  }
+
+  if(req.method==='GET'&&path==='/api/payment-status'){
+    const id=Number(new URL(req.url,'http://localhost').searchParams.get('id'));
+    if(!id)return json(res,400,{error:'Invalid payment id.'});
+    const r=await db.execute({sql:`SELECT id,status,password_hash,expires_at FROM purchases WHERE id=?`,args:[id]});
+    if(!r.rows.length)return json(res,404,{error:'Payment not found.'});
+    const p=r.rows[0];
+    return json(res,200,{status:p.status,hasPassword:!!p.password_hash,expiresAt:p.expires_at||null});
+  }
+
+  if(req.method==='POST'&&path==='/api/create-account'){
+    const b=await body(req),password=String(b.password||''),confirm=String(b.confirmPassword||''),purchaseId=Number(b.purchase_id);
+    if(!purchaseId||!password||!confirm)return json(res,400,{error:'Password and confirmation are required.'});
+    if(password!==confirm)return json(res,400,{error:'Passwords do not match.'});
+    if(password.length<8||password.length>128)return json(res,400,{error:'Password must be 8-128 characters.'});
+    const p=await db.execute({sql:`SELECT id,status,password_hash FROM purchases WHERE id=? LIMIT 1`,args:[purchaseId]}),row=p.rows[0];
+    if(!row||row.status!=='approved')return json(res,403,{error:'Payment has not been approved.'});
+    if(row.password_hash)return json(res,409,{error:'Password is already set for this purchase.'});
+    const hash=await bcrypt.hash(password,12);
+    const u=await db.execute({sql:`UPDATE purchases SET password_hash=? WHERE id=? AND status='approved' AND password_hash IS NULL`,args:[hash,purchaseId]});
+    if(!u.rowsAffected)return json(res,409,{error:'Password is already set for this purchase.'});
+    return json(res,200,{ok:true});
+  }
+
+  if(req.method==='POST'&&path==='/api/login'){
+    const b=await body(req),password=String(b.password||''),deviceId=String(b.device_id||'');
+    if(!password||!deviceId)return json(res,400,{error:'Password and device are required.'});
+    const r=await db.execute({sql:`SELECT id,password_hash,expires_at,status FROM purchases WHERE status IN ('approved','disabled') AND password_hash IS NOT NULL ORDER BY id DESC`});
+    let p=null;
+    for(const row of r.rows){if(row.expires_at&&Date.now()>row.expires_at)continue;if(await bcrypt.compare(password,row.password_hash)){p=row;break}}
+    if(!p)return json(res,401,{error:'Invalid password.'});
+    if(p.status==='disabled')return json(res,403,{error:'এই এক্সেস কোডটি অফ করা হয়েছে। পুনরায় চালু করতে @JISANexe এই টেলিগ্রাম আইডিতে যোগাযোগ করুন।'});
+    const old=await db.execute({sql:`SELECT * FROM sessions_v2 WHERE purchase_id=? LIMIT 1`,args:[p.id]});
+    if(old.rows.length&&old.rows[0].device_id&&old.rows[0].device_id!==deviceId)return json(res,409,{error:'এই Password একটি অন্য ডিভাইসে ব্যবহার হচ্ছে। এক Password একসাথে দুই ডিভাইসে চলবে না।'});
+    const token=crypto.randomBytes(32).toString('hex');
+    if(old.rows.length)await db.execute({sql:`UPDATE sessions_v2 SET token=?,device_id=?,created_at=? WHERE purchase_id=?`,args:[token,deviceId,Date.now(),p.id]});
+    else await db.execute({sql:`INSERT INTO sessions_v2(token,purchase_id,device_id,created_at) VALUES(?,?,?,?)`,args:[token,p.id,deviceId,Date.now()]});
+    return json(res,200,{session:token});
+  }
+
+  if(req.method==='GET'&&path==='/api/markets'){
+    if(!await auth(req))return json(res,401,{error:'Login required.'});
+    return json(res,200,{markets:ASSETS});
+  }
+
+  if(req.method==='POST'&&path==='/api/signal'){
+    if(!await auth(req))return json(res,401,{error:'Login required.'});
+    const b=await body(req),market=ASSETS.find(x=>x.name===String(b.market||''));
+    if(!market)return json(res,400,{error:'Invalid asset.'});
+    const allowed=market.otc?['5 SEC','10 SEC','15 SEC','30 SEC','1 MINUTE','5 MINUTE']:['1 MINUTE','5 MINUTE'];
+    if(!allowed.includes(b.timeframe))return json(res,400,{error:'Invalid timeframe for this market.'});
+    return json(res,200,{direction:Math.random()<.5?'UP':'DOWN',generated_at:Date.now(),mode:'generated/demo'});
+  }
+
+  if(req.method==='GET'&&path==='/api/admin/purchases'){
+    if(!admin(req))return json(res,401,{error:'Unauthorized'});
+    const r=await db.execute(`SELECT id,reference,proof,payment_method,payment_account,status,password_hash,created_at,approved_at,expires_at FROM purchases ORDER BY id DESC`);
+    return json(res,200,{items:r.rows.map(x=>({...x,password_set:!!x.password_hash,password_hash:undefined}))});
+  }
+
+  if(req.method==='POST'&&path==='/api/admin/approve'){
+    if(!admin(req))return json(res,401,{error:'Unauthorized'});
+    const b=await body(req),id=Number(b.purchase_id);if(!id)return json(res,400,{error:'purchase_id required'});
+    const now=Date.now();
+    const r=await db.execute({sql:`UPDATE purchases SET status='approved',approved_at=?,expires_at=? WHERE id=? AND status='pending'`,args:[now,now+30*24*60*60*1000,id]});
+    return json(res,200,{ok:r.rowsAffected>0,message:'Payment accepted. User creates their own password.'});
+  }
+
+  if(req.method==='POST'&&path==='/api/admin/reject'){
+    if(!admin(req))return json(res,401,{error:'Unauthorized'});
+    const b=await body(req),id=Number(b.purchase_id);if(!id)return json(res,400,{error:'purchase_id required'});
+    await db.execute({sql:`UPDATE purchases SET status='rejected' WHERE id=? AND status='pending'`,args:[id]});
+    return json(res,200,{ok:true});
+  }
+
+  if(req.method==='POST'&&path==='/api/admin/disable'){
+    if(!admin(req))return json(res,401,{error:'Unauthorized'});
+    const b=await body(req),id=Number(b.purchase_id);if(!id)return json(res,400,{error:'purchase_id required'});
+    await db.execute({sql:`UPDATE purchases SET status='disabled' WHERE id=? AND status='approved'`,args:[id]});
+    await db.execute({sql:`DELETE FROM sessions_v2 WHERE purchase_id=?`,args:[id]});
+    return json(res,200,{ok:true,message:'Access disabled.'});
+  }
+
+  if(req.method==='POST'&&path==='/api/admin/enable'){
+    if(!admin(req))return json(res,401,{error:'Unauthorized'});
+    const b=await body(req),id=Number(b.purchase_id);if(!id)return json(res,400,{error:'purchase_id required'});
+    const now=Date.now();
+    await db.execute({sql:`UPDATE purchases SET status='approved',expires_at=? WHERE id=? AND status='disabled'`,args:[now+30*24*60*60*1000,id]});
+    return json(res,200,{ok:true,message:'Access enabled.'});
+  }
+
+  return json(res,404,{error:'Not found'});
+}catch(err){console.error(err);return json(res,500,{error:err?.message||'Server error.'})}}
+
 module.exports=handler;
