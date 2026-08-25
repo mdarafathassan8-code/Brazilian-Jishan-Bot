@@ -24,7 +24,17 @@
     <section id="buy" class="card hidden">
       <button class="back" data-back>← Back</button>
       <div class="eyebrow">PURCHASE</div><h2>Brazilian Jishan Bot — $20</h2>
-      <p class="muted">Submit your payment proof. Credentials are issued after admin approval.</p>
+      <p class="muted">Pay $20 through Binance, then submit your payment screenshot. Credentials are issued after admin approval.</p>
+
+      <div class="payment-box">
+        <div class="payment-label">Binance ID</div>
+        <div class="payment-row">
+          <input id="binanceId" value="853973504" readonly aria-label="Binance ID">
+          <button id="copyBinance" class="secondary copy-btn" type="button">COPY</button>
+        </div>
+        <div id="copyMsg" class="copy-msg" aria-live="polite"></div>
+      </div>
+
       <label>Payment reference<input id="paymentRef" maxlength="80" placeholder="Optional transaction/reference ID"></label>
       <label>Payment screenshot<input id="paymentProof" type="file" accept="image/*"></label>
       <button id="submitPayment" class="primary">SUBMIT PAYMENT</button>
