@@ -4,8 +4,27 @@ $('#buyBtn').onclick=()=>show('buy');$('#loginBtn').onclick=()=>show('login');do
 function msg(el,text,error=false){el.textContent=text;el.className='message'+(error?' error':'')}
 async function apiJson(response){const text=await response.text();let data;try{data=text?JSON.parse(text):{}}catch{throw Error(response.ok?'Server returned an invalid response.':'Server error: '+text.replace(/<[^>]*>/g,' ').replace(/\s+/g,' ').trim().slice(0,180))}if(!response.ok)throw Error(data.error||'Request failed');return data}
 $('#copyBinance').onclick=async()=>{const id=$('#binanceId').value;try{await navigator.clipboard.writeText(id);$('#copyMsg').textContent='Binance ID copied.'}catch{$('#binanceId').select();document.execCommand('copy');$('#copyMsg').textContent='Binance ID copied.'}setTimeout(()=>$('#copyMsg').textContent='',2200)};
-async function compressImage(file){const bitmap=await createImageBitmap(file);const max=1600;const scale=Math.min(1,max/Math.max(bitmap.width,bitmap.height));const canvas=document.createElement('canvas');canvas.width=Math.max(1,Math.round(bitmap.width*scale));canvas.height=Math.max(1,Math.round(bitmap.height*scale));const ctx=canvas.getContext('2d',{alpha:false});ctx.drawImage(bitmap,0,0,canvas.width,canvas.height);bitmap.close();let quality=.72;let data=canvas.toDataURL('image/jpeg',quality);while(data.length>1_700_000&&quality>.42){quality-=.08;data=canvas.toDataURL('image/jpeg',quality)}if(data.length>1_700_000)throw Error('Screenshot is too large. Please choose a smaller image.');return data}
-$('#submitPayment').onclick=async()=>{const btn=$('#submitPayment'),file=$('#paymentProof').files[0];if(!file)return msg($('#buyMsg'),'Please select your payment screenshot.',true);if(!file.type.startsWith('image/'))return msg($('#buyMsg'),'Please select an image screenshot.',true);btn.disabled=true;btn.textContent='SUBMITTING…';msg($('#buyMsg'),'Preparing secure payment proof…');try{const proof=await compressImage(file);const r=await fetch('/api/purchase',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reference:$('#paymentRef').value.trim(),proof,payment_method:'BINANCE',payment_account:$('#binanceId').value})});await apiJson(r);msg($('#buyMsg'),'Payment submitted. Wait for admin approval.');$('#paymentProof').value=''}catch(e){msg($('#buyMsg'),e.message,true)}finally{btn.disabled=false;btn.textContent='SUBMIT PAYMENT'}};
+
+// Keep normal image uploads in their original format when they are small enough.
+// Only resize/re-encode when necessary so PNG/WebP/etc. are accepted too.
+function readFileAsDataURL(file){return new Promise((resolve,reject)=>{const r=new FileReader();r.onload=()=>resolve(String(r.result));r.onerror=()=>reject(Error('Could not read the selected image.'));r.readAsDataURL(file)})}
+async function prepareImage(file){
+  const MAX=1_500_000;
+  const original=await readFileAsDataURL(file);
+  if(original.length<=MAX)return original;
+  const bitmap=await createImageBitmap(file);
+  const max=1400;const scale=Math.min(1,max/Math.max(bitmap.width,bitmap.height));
+  const canvas=document.createElement('canvas');canvas.width=Math.max(1,Math.round(bitmap.width*scale));canvas.height=Math.max(1,Math.round(bitmap.height*scale));
+  const ctx=canvas.getContext('2d',{alpha:true});ctx.drawImage(bitmap,0,0,canvas.width,canvas.height);bitmap.close();
+  const mime=['image/png','image/webp','image/jpeg'].includes(file.type)?file.type:'image/jpeg';
+  let quality=.78;let data=canvas.toDataURL(mime,quality);
+  while(data.length>MAX&&quality>.45){quality-=.08;data=canvas.toDataURL(mime,quality)}
+  if(data.length>MAX){const smaller=document.createElement('canvas');smaller.width=Math.max(1,Math.round(canvas.width*.75));smaller.height=Math.max(1,Math.round(canvas.height*.75));smaller.getContext('2d',{alpha:true}).drawImage(canvas,0,0,smaller.width,smaller.height);data=smaller.toDataURL(mime,.65)}
+  if(data.length>MAX)throw Error('Image is too large. Please choose a smaller screenshot.');
+  return data
+}
+
+$('#submitPayment').onclick=async()=>{const btn=$('#submitPayment'),file=$('#paymentProof').files[0];if(!file)return msg($('#buyMsg'),'Please select your payment screenshot.',true);if(!file.type.startsWith('image/'))return msg($('#buyMsg'),'Please select an image screenshot (PNG, JPG, JPEG, WEBP, etc.).',true);btn.disabled=true;btn.textContent='SUBMITTING…';msg($('#buyMsg'),'Preparing payment proof…');try{const proof=await prepareImage(file);const r=await fetch('/api/purchase',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reference:$('#paymentRef').value.trim(),proof,payment_method:'BINANCE',payment_account:$('#binanceId').value})});await apiJson(r);msg($('#buyMsg'),'Payment submitted. Wait for admin approval.');$('#paymentProof').value=''}catch(e){msg($('#buyMsg'),e.message,true)}finally{btn.disabled=false;btn.textContent='SUBMIT PAYMENT'}};
 $('#doLogin').onclick=async()=>{const id=$('#loginId').value.trim(),password=$('#loginPassword').value;if(!id||!password)return msg($('#loginMsg'),'Enter your ID and password.',true);try{const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,password,device_id:getDeviceId()})});const d=await apiJson(r);localStorage.setItem('bjb_session',d.session);show('dashboard');loadMarkets()}catch(e){msg($('#loginMsg'),e.message,true)}};
 $('#logout').onclick=()=>{localStorage.removeItem('bjb_session');show('landing')};
 function getDeviceId(){let x=localStorage.getItem('bjb_device');if(!x){x=crypto.randomUUID();localStorage.setItem('bjb_device',x)}return x}
